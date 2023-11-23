@@ -1,1 +1,6 @@
 variable,long_name,units,standard_name,comment
+Nights Fished,Nights_Fished,integer,,Usually either 1 or 2
+Hours Fished,Hours_Fished,whole number,,
+Number of Dungeness megalopae,Metacarcinus_magister_megalopae,whole number,,Usually an integer although sometimes subsampling protocols can produce estimates with decimals
+Number of Dungeness juvenile instars,Metacarcinus_magister_instar,whole number,,Usually an integer although sometimes subsampling protocols can produce estimates with decimals
+Total Dungeness,TotalMmagister,whole number,,Total of 
