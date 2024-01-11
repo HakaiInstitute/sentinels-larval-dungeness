@@ -1,0 +1,348 @@
+---
+title: "Sentinels-of-change-DwC-wrangle"
+author: "Tim van der Stap"
+date: "2023-04-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set
+library(tidyverse)
+library(obistools)
+library(worrms)
+library(lubridate)
+library(janitor)
+library(here)
+```
+
+This .Rmd file contains the script used to standardize the count and size data of M. magister data collected during the Sentinels of Change (SOC) project. Through this script, the data is standardized to Darwin Core to allow interoperability with other data records in the Ocean Biodiversity Information System (OBIS).
+
+Read in the files from the _data_ folder. Individual years are included as subfolders, the `Master_QAQC_LightTrap_Counts.csv` file contains the QAQCd count data from all sampling years, and the `megalopae_width_photo_calipers.csv` file contains the carapace width data. As per the [Sentinels of Change Light Trap Network DMP](https://dmptool.org/plans/78175), some problematic data entries should be filtered out during data analyses and are therefore omitted from the standardized data on OBIS. These problematic data entries are found under "error_code" and include `MET` (missing metadata), `BAT` (trap fished for over 25 hours), `DNF` (trap did not fish properly), and `ERR` (protocols not followed properly and counts likely not accurate). 
+
+```{r read in files, message = FALSE}
+
+# Read in the station data:
+stations <- read_csv(here("data", "Master_Stations.csv")) %>%
+  janitor::clean_names() %>%
+  select(code, site, organization)
+
+# Read in the count data:
+dung_count <- read_csv(here("data", "Master_QAQC_LightTrap_Counts.csv")) %>%
+  janitor::clean_names() %>%
+  filter(!error_code %in% c("BAT", "MET", "MDNF", "ERR")) %>%
+  select(code, site, lat, lon, year, month, date, weather, hours_fished, nights_fished,
+         metacarcinus_magister_megalopae, metacarcinus_magister_instar)
+
+# Read in associated carapace width (cw) data.
+cw_2022 <- read_csv(here("data", "2022", "megalopae_widths_photo_calipers.csv")) %>%
+  janitor::clean_names() %>%
+  rename(site = location) %>%
+  left_join(stations, by = "site")
+
+# cw_2023 <- read_csv(here("data", "2023", "....csv")) %>%
+#  janitor::clean_names() %>%
+#  rename(site = location) %>%
+#  left_join(stations, by = "site")
+
+# Combine all individual years of data. Add additional years' of data when available:
+carapace <- cw_2022
+
+```
+
+## Section 1. Event Core
+
+Given that there's a sampling event (the deployment of the LED light trap at several stations) for this project, our schema will consist of an Event Core (Section 1) and three extension data tables: occurrence (Section 2), resourceRelationship (Section 3) and extended measurementOrFact (Section 4). In the final section (Section 5) we'll do some basic QAQC to ensure the formatted data follows the standards outlined in the DwC schema. The event table will include information on the sampling event, such as date, location, organization responsible for collecting and owning the data, and data related to the sampling effort (hours fished). 
+
+```{r event core, message = FALSE}
+
+SOC <- dung_count %>%
+  mutate(year = as.numeric(format(as.Date(dung_count$date), "%Y")),
+         month = as.numeric(format(as.Date(dung_count$date), "%m")),
+         day = as.numeric(format(as.Date(dung_count$date), "%d")),
+         eventID = paste("SOC", code, year, month, day, sep = "-"),
+         language = "en",
+         license = "http://creativecommons.org/licenses/by/4.0/legalcode",
+         bibliographicCitation = "Whalen, M., & Earle, H. (2023). Larval Dungeness crab arrival, abundance, and size in the Salish Sea, British Columbia [Data set]. Hakai Institute. https://doi.org/10.21966/36hp-7f40", #TODO: Confirm this citation is still accurate.
+         accessRights = "https://github.com/timvdstap/sentinels-light-trap/blob/main/LICENSE",
+         rightsHolder = "Hakai Institute",
+         institutionCode = "Hakai Institute",
+         institutionID = "https://edmo.seadatanet.org/report/5148",
+         geodeticDatum = "WGS84",
+         modified = lubridate::today(),
+         samplingProtocol = "LED light trap", #TODO: if public protocol exists (with DOI?) link to that.
+         sampleSizeEffort = paste(hours_fished, "hours of light trap fishing"),
+         sampleSizeUnit = "hours",
+         country = "Canada",
+         countryCode = "CA",
+         minimumDepthInMeters = 0,
+         maximumDepthInMeters = 2,
+         coordinateUncertaintyInMeters = "")
+
+#TODO: Figure out whether there is a specific coordinateUncertainty from GPS. coordinateUncertaintyInMeters might be important because sites are so close to shore.
+
+# Select the columns for the Event Core: 
+SOC_event <- SOC %>%
+  select(-c(code, metacarcinus_magister_instar, metacarcinus_magister_megalopae)) %>%
+  rename(decimalLatitude = lat,
+         decimalLongitude = lon,
+         eventDate = date, 
+         sampleSizeValue = hours_fished,
+         verbatimLocality = site) %>%
+  mutate(eventRemarks = paste0(weather, ".")) %>%
+  select(-weather)
+
+# Include nights fished in the eventRemarks as well, allowing users to understand hours fished and nights fished.
+SOC_event <- SOC_event %>%
+  mutate(eventRemarks = ifelse(nights_fished == 1, paste(eventRemarks, "Hours fished were spread over", nights_fished, "night."), 
+                               ifelse(nights_fished == 2, paste(eventRemarks, "Hours fished were spread over", nights_fished, "nights."),
+                               eventRemarks)))
+
+# Remove NAs from the dataframe and save locally:
+SOC_event[is.na(SOC_event)] <- ""
+SOC_event <- as_tibble(SOC_event)
+write_csv(SOC_event, here("obis", "SOC_event.csv"))
+
+```
+
+## Section 2. Occurrence extension
+
+The first extension that we create is the occurrence extension. We create two tables which we'll eventually join. The first occurrence extension table will contain the OccurrenceIDs that are nested under an eventID. These occurrenceIDs will uniquely reflect the count of M. magister instar and megalopae lifestages during each sampling event. When creating the occurrenceID I will `group_by` eventID, in the event that future iterations of this dataset will include bycatch. This should ensure that occurrenceID will remain the same irrespective of these species being added.
+
+The second extension data table is used to create unique occurrenceIDs for individual measurements. As the individual measurements are done just on the _megalopae_, **not** on the instar lifestage, we'll have to filter for those and then eventually ensure that for users of this data, it is clear that these occurrences are `nested` under the occurrenceID (that includes individualCount). In other words, we have to ensure that users understand that the individual measurements were not done from a separate sampling event than the overall count data associated with the event. We elaborate on this relationship in the `resourceRelationship` extension (Section 3). 
+
+```{r SOC occ, message = FALSE}
+
+occ <- left_join(dung_count, stations, by = c("code", "site")) %>%
+  mutate(year = as.numeric(format(as.Date(dung_count$date), "%Y")),
+         month = as.numeric(format(as.Date(dung_count$date), "%m")),
+         day = as.numeric(format(as.Date(dung_count$date), "%d")),
+         eventID = paste("SOC", code, year, month,day, sep = "-")) %>%
+  select(eventID, organization, metacarcinus_magister_instar, metacarcinus_magister_megalopae) %>%
+  pivot_longer(metacarcinus_magister_instar:metacarcinus_magister_megalopae,
+               names_to = "verbatimIdentification",
+               values_to = "individualCount")
+
+# Add lifestage columns:
+occ <- occ %>%
+  mutate(lifeStage = case_when(
+    grepl("megalopae", verbatimIdentification) ~ "megalopae",
+    grepl("instar", verbatimIdentification) ~ "instar"))
+
+# Add column with scientific name so we can match that to WoRMS. Easy as it's only 1 species!
+occ <- occ %>% mutate(scientificName = "Metacarcinus magister")
+
+soc_worms <- worrms::wm_records_names(unique(occ$scientificName), marine_only = T) %>%
+  dplyr::bind_rows() %>% rename(scientificName = scientificname)
+
+# Join back to the occurrence table:
+occ <- left_join(occ, soc_worms, by = "scientificName")
+
+# Add additional fields, such as specificEpithet, occurrenceID, occurrenceStatus and basisOfRecord 
+occ <- occ %>%
+  mutate(specificEpithet = stringr::word(scientificName, 2),
+         authority = str_replace_all(authority, "\\(|\\)", ""),
+         scientificName = ifelse(!is.na(authority),
+                                 paste0(scientificName, " (", authority, ")"),
+                                 scientificName)) %>%
+  group_by(eventID) %>%
+  mutate(occurrenceID = paste(eventID, row_number(), sep = "-"),
+         occurrenceStatus = ifelse(individualCount > 0, "present", "absent"),
+         basisOfRecord = "HumanObservation") %>%
+  ungroup()
+
+# Select columns for the occurrence extension:
+SOC_occ <- occ %>%
+  select(eventID, verbatimIdentification,
+         recordedBy = organization,
+         individualCount, scientificName,
+         scientificNameID = lsid,
+         taxonRank = rank,
+         scientificNameAuthorship = authority,
+         taxonomicStatus = status,
+         occurrenceID,
+         occurrenceStatus,
+         kingdom, phylum, class, order, family, genus, specificEpithet,
+         lifeStage, basisOfRecord)
+```
+
+Next, we create the 'second occurrence extension' data table, to include occurrenceIDs for just the megalopae lifestage occurrences. We'll use these individual occurrenceIDs in the extended measurement or fact extension as well.
+
+```{r, message = FALSE}
+
+temp <- SOC_occ %>%
+  filter(lifeStage == "megalopae") %>%
+  select(eventID, occurrenceID, individualCount)
+
+# From the carapace data table, extract day, month and year from the date to help create the eventID:
+carapace$day <- as.numeric(format(as.Date(carapace$date, format = "%m/%d/%Y"), "%d"))
+carapace$month <- as.numeric(format(as.Date(carapace$date, format = "%m/%d/%Y"), "%m"))
+carapace$year <- as.numeric(format(as.Date(carapace$date, format = "%m/%d/%Y"), "%Y"))
+carapace$eventID <- paste("SOC", carapace$code, carapace$year, carapace$month, carapace$day, sep = "-")
+
+carapace <- left_join(temp, carapace, by = "eventID") %>%
+  select(-c(week_start_date, photo_quality, comments, total_measured, mean, sd, se)) %>%
+  pivot_longer(m1:m30,
+               names_to = "measurementType",
+               values_to = "measurementValue")
+
+# Remove rows where measurementValue is NA
+carapace <- carapace %>% drop_na()
+
+# We want to assign an occurrenceID. For this, we'll want to:
+# 1) parse out the measurementType (i.e. length1) into a character string (length) and numerical value (1)
+# 2) Include 'ind' in the occurrenceID as this will make it easier to query in the resourceRelationship extension.
+
+cw_ind <- carapace %>%
+  separate(., measurementType, into = c("text", "num"),
+           sep = "(?<=[A-Za-z])(?=[0-9])") %>%
+  mutate(occurrenceID = paste(occurrenceID, "ind", num, sep = "-")) %>%
+  select(eventID, occurrenceID,
+         measurementType = text,
+         measurementValue,
+         technique) %>%
+  mutate(across("measurementType", str_replace, "m", "carapace width"),
+         individualCount = NA) %>%
+  distinct()
+
+```
+
+Finally, we combine these two occurrence data tables. I prefer re-ordering the occurrenceIDs to better visualize the nested hierarchy. After doing this, we fill in all the columns to match the information from the row above. We do this for all columns _except_ individualCount. We don't populate the individualCount for occurrenceIDs related to a single individual because this might confuse users in thinking that this value is in addition to the individualCount associated with the overall count.
+
+```{r, message = FALSE}
+
+overall_occ <- dplyr::bind_rows(SOC_occ, cw_ind)
+
+# Re-order the occurrenceIDs, remove columns for measurementType and measurementValue:
+order <- stringr::str_sort(overall_occ$occurrenceID, numeric = TRUE)
+SOC_occ_extension <- overall_occ[match(order, overall_occ$occurrenceID),]
+SOC_occ_extension <- SOC_occ_extension %>% fill(c(verbatimIdentification, recordedBy, scientificName, scientificNameID, taxonRank, scientificNameAuthorship,
+                                  taxonomicStatus, occurrenceStatus, kingdom, phylum, class, order, family, genus, specificEpithet,
+                                  lifeStage, basisOfRecord)) %>%
+  select(-c(measurementType, measurementValue))
+
+# Remove NAs and save locally in the obis folder:
+SOC_occ_extension <- SOC_occ_extension %>% mutate_all(as.character)
+SOC_occ_extension[is.na(SOC_occ_extension)] <- ""
+SOC_occ_extension <- as_tibble(SOC_occ_extension)
+write_csv(SOC_occ_extension, here("obis", "SOC_occ.csv"))
+
+```
+
+## Section 3. Resource Relationship extension
+
+In the next section/extension table, we want to explicitly state the relation that individual measurements of carapace have to the 'umbrella' occurrenceID. This will help users understand that a subset of the total individualCount were measured individually, and furthermore that when tallying the total count of megalopae at a sampling event, they should not be adding these values (hence why left empty) to the overall individualCount. We specify this relationship in the `resourceRelationship` extension.
+
+```{r, message = FALSE}
+
+SOC_resourceRelationship <- SOC_occ_extension %>%
+  select(eventID, occurrenceID, scientificName) %>%
+  mutate(resourceID = ifelse(grepl("ind", SOC_occ_extension$occurrenceID), SOC_occ_extension$occurrenceID, NA),
+         relatedResourceID = ifelse(grepl("ind", SOC_occ_extension$occurrenceID), NA, SOC_occ_extension$occurrenceID),
+         relationshipOfResource = ifelse(!is.na(resourceID), "is a subset of", NA)) %>%
+  dplyr::arrange(eventID, scientificName) %>%
+  fill(relatedResourceID) %>%
+  filter(!is.na(resourceID))
+
+order <- stringr::str_sort(SOC_resourceRelationship$resourceID, numeric = TRUE)
+SOC_resourceRelationship <- SOC_resourceRelationship[match(order, SOC_resourceRelationship$resourceID),]
+
+SOC_resourceRelationship <- SOC_resourceRelationship %>%
+  mutate(resourceRelationshipID = paste(relatedResourceID, "rr", sep = "-"),
+         ID = sprintf("%03d", row_number()),
+         resourceRelationshipID = paste(resourceRelationshipID, ID, sep = "-")) %>%
+  select(eventID, resourceRelationshipID, resourceID, relationshipOfResource, relatedResourceID)
+
+write_csv(SOC_resourceRelationship, here("obis", "SOC_resourceRelationship.csv"))
+
+```
+
+## Section 4. Extended measurement Or Fact extension
+
+Finally, we create the extended measurementOrFact (eMOF) data table, which will include information on sampling effort, as well as carapace width measurements and controlled vocabulary for the M. magister observed (count, lifestage, carapace width). The measurementIDs created will be nested either directly under the eventID (when it concerns the measurements or facts on the sampling event), or nested under the occurrenceID when it concerns biometric data. 
+
+```{r, message = FALSE}
+
+# Measurements or facts data related to the sampling efforts:
+emof_event <- left_join(SOC_event, SOC_occ, by = "eventID") %>%
+  select(eventID, 
+         hours_fished = sampleSizeValue,
+         sampling_method = samplingProtocol) %>%
+  distinct(eventID, .keep_all = T) %>%
+  mutate_all(as.character) %>%
+  pivot_longer(cols = hours_fished:sampling_method,
+               names_to = "measurementType",
+               values_to = "measurementValue") %>%
+  mutate(measurementID = paste(eventID, measurementType, row_number(), sep = "-")) %>%
+  mutate(measurementValueID = case_when(
+    measurementValue == "LED light trap" ~ " ")) %>%
+  mutate(measurementTypeID = case_when(
+    measurementType == "sampling_method" ~ "https://vocab.nerc.ac.uk/collection/Q01/current/Q0100003/",
+    measurementType == "hours_fished" ~ "https://vocab.nerc.ac.uk/collection/P01/current/AZDRZZ01/")) %>% 
+  mutate(measurementUnit = case_when(
+    measurementType == "hours_fished" ~ "hours")) %>%
+  mutate(measurementUnitID = case_when(
+    measurementUnit == "hours" ~ "https://vocab.nerc.ac.uk/collection/P06/current/UHOR/")) 
+
+# Measurements related to the overall occurrenceID (count, lifestage)
+emof_occ <- left_join(SOC_event, SOC_occ, by = "eventID") %>%
+  select(eventID, occurrenceID, individualCount, lifeStage) %>%
+  distinct(occurrenceID, .keep_all = T) %>%
+  mutate_all(as.character) %>%
+  pivot_longer(cols = individualCount:lifeStage,
+               names_to = "measurementType",
+               values_to = "measurementValue") %>%
+  mutate(measurementID = paste(occurrenceID, row_number(), sep = "-")) %>%
+  mutate(measurementTypeID = case_when(
+    measurementType == "lifeStage" ~ "http://vocab.nerc.ac.uk/collection/P01/current/LSTAGE01/",
+    measurementType == "individualCount" ~ "http://vocab.nerc.ac.uk/collection/P01/current/OCOUNT01/")) %>%
+  mutate(measurementValueID = case_when(
+    measurementValue == "instar" ~ "http://vocab.nerc.ac.uk/collection/S11/current/S1105/",
+    measurementValue == "megalopae" ~ "http://vocab.nerc.ac.uk/collection/S11/current/S1167/")) %>%
+  mutate(measurementUnit = case_when(
+    measurementType == "individualCount" ~ "individuals")) %>%
+  mutate(measurementUnitID = case_when(
+    measurementUnit == "individuals" ~ "http://vocab.nerc.ac.uk/collection/P06/current/UUUU/"))
+
+# Measurements (carapace width) related to individuals:
+carapace_emof <- cw_ind %>%
+  mutate(measurementID = paste(occurrenceID, row_number(), sep = "-"),
+         measurementTypeID = case_when(
+           measurementType == "carapace width" ~ "http://vocab.nerc.ac.uk/collection/P01/current/CAPWID01/")) %>%
+  mutate(measurementUnit = "mm",
+         measurementUnitID = "http://vocab.nerc.ac.uk/collection/P06/current/UXMM/") %>%
+  rename(measurementMethod = technique) %>%
+  select(-individualCount)
+
+# Combine the two emof data tables:  
+SOC_emof <- plyr::rbind.fill(emof_event, emof_occ, carapace_emof) 
+
+# Remove NAs:
+SOC_emof[is.na(SOC_emof)] <- ""
+SOC_emof <- as_tibble(SOC_emof)
+
+# Save locally as .csv file:
+write_csv(SOC_emof, here("obis", "SOC_emof.csv"))
+
+```
+
+## Section 5. Basic QAQC
+
+```{r basic QAQC, message = FALSE}
+
+# Plot points on a map:
+SOC_event$decimalLatitude <- as.numeric(SOC_event$decimalLatitude)
+SOC_event$decimalLongitude <- as.numeric(SOC_event$decimalLongitude)
+SOC_leaflet <- obistools::plot_map_leaflet(SOC_event)
+SOC_map <- obistools::plot_map(SOC_event, zoom = TRUE)
+ggsave(filename = "SOC_map.png", plot = SOC_map, path = here::here("obis", "maps"))
+
+# -- check eventDate
+obistools::check_eventdate(SOC_event) # Confirm that this shows a 0 x 0 tibble (i.e. no errors).
+
+# As we're working with an Event Core, the fields for eventDate, decimalLatitude and decimalLongitude should be in that table (no need for duplication)
+obistools::check_fields(SOC_occ)
+
+# check_extension_eventids() checks if all eventIDs in an extension have a matching eventID in the core table (should be empty dataframe):
+obistools::check_extension_eventids(SOC_event, SOC_occ)
+
+```
